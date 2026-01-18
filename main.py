@@ -2,14 +2,10 @@ import cv2
 import base64
 import numpy as np
 import mediapipe as mp
-import json
 import os
 from fastapi import FastAPI, WebSocket
 import uvicorn
-
-import keras
 from keras.models import load_model
-print(f"Biblioteca Keras carregada (Versão: {keras.__version__})")
 
 app = FastAPI()
 
@@ -24,102 +20,103 @@ model_mlp = None
 model_cnn = None
 classes = ["A", "B", "C"]
 
-print("Carregando modelos de IA...")
+clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
 
 if os.path.exists("classes.npy"):
-    try:
-        classes = np.load("classes.npy", allow_pickle=True)
-        print(f"Classes carregadas: {classes}")
-    except Exception as e:
-        print(f"Erro ao abrir classes.npy: {e}")
+    classes = np.load("classes.npy", allow_pickle=True)
 
 try:
     model_mlp = load_model("modelo_mlp.keras")
-    print("Rede MLP carregada")
-except Exception as e:
-    print(f"Erro ao carregar modelo MLP: {e}")
+    print("MLP carregada")
+except:
+    print("Erro ao carregar MLP")
 
 try:
     model_cnn = load_model("modelo_cnn1d.keras")
-    print("Rede CNN carregada")
-except Exception as e:
-    print(f"Erro ao carregar modelo CNN: {e}")
-
+    print("CNN carregada")
+except:
+    print("Erro ao carregar CNN")
 
 @app.websocket("/ws")
 async def libras_websocket(websocket: WebSocket):
     await websocket.accept()
-    print("WebSocket conectado")
-    
+
     try:
         while True:
             data = await websocket.receive_json()
             image_b64 = data.get("image")
-            
-            if image_b64:
-                print(".", end="", flush=True)
+
+            if not image_b64:
+                continue
+
+            if ',' in image_b64:
+                _, imgstr = image_b64.split(',')
             else:
-                print("JSON recebido sem imagem")
-            
-            if image_b64:
-                if ',' in image_b64:
-                    _, imgstr = image_b64.split(',')
-                else:
-                    imgstr = image_b64
-                
-                nparr = np.frombuffer(base64.b64decode(imgstr), np.uint8)
-                frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+                imgstr = image_b64
 
-                if frame is None:
-                    print("Erro ao decodificar imagem")
-                    continue
+            nparr = np.frombuffer(base64.b64decode(imgstr), np.uint8)
+            frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
 
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                results = hands.process(frame_rgb)
+            if frame is None:
+                continue
 
-                resposta_final = {
-                    "mlp": {"letra": "-", "confianca": 0.0},
-                    "cnn": {"letra": "-", "confianca": 0.0}
-                }
+            frame = cv2.GaussianBlur(frame, (5, 5), 0)
 
-                if results.multi_hand_landmarks:
-                    for hand_landmarks in results.multi_hand_landmarks:
-                        pontos = []
-                        for lm in hand_landmarks.landmark:
-                            pontos.extend([lm.x, lm.y, lm.z])
-                        
-                        dados_brutos = np.array(pontos)
+            lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            l2 = clahe.apply(l)
+            lab = cv2.merge((l2, a, b))
+            frame = cv2.cvtColor(lab, cv2.COLOR_LAB2BGR)
 
-                        if model_mlp:
-                            try:
-                                input_mlp = dados_brutos.reshape(1, 63)
-                                pred_mlp = model_mlp.predict(input_mlp, verbose=0)
-                                idx_mlp = np.argmax(pred_mlp)
-                                conf_mlp = float(np.max(pred_mlp))
-                                resposta_final["mlp"] = {
-                                    "letra": str(classes[idx_mlp]),
-                                    "confianca": round(conf_mlp * 100, 1)
-                                }
-                            except Exception as e:
-                                print(f"Erro MLP: {e}")
+            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            results = hands.process(frame_rgb)
 
-                        if model_cnn:
-                            try:
-                                input_cnn = dados_brutos.reshape(1, 21, 3)
-                                pred_cnn = model_cnn.predict(input_cnn, verbose=0)
-                                idx_cnn = np.argmax(pred_cnn)
-                                conf_cnn = float(np.max(pred_cnn))
-                                resposta_final["cnn"] = {
-                                    "letra": str(classes[idx_cnn]),
-                                    "confianca": round(conf_cnn * 100, 1)
-                                }
-                            except Exception as e:
-                                print(f"Erro CNN: {e}")
+            resposta = {
+                "mlp": {"letra": "-", "confianca": 0},
+                "cnn": {"letra": "-", "confianca": 0},
+                "roi": None
+            }
 
-                await websocket.send_json(resposta_final)
+            if results.multi_hand_landmarks:
+                for hand_landmarks in results.multi_hand_landmarks:
+                    x_vals = [lm.x for lm in hand_landmarks.landmark]
+                    y_vals = [lm.y for lm in hand_landmarks.landmark]
+
+                    x_min = min(x_vals) * 100
+                    y_min = min(y_vals) * 100
+                    box_w = (max(x_vals) - min(x_vals)) * 100
+                    box_h = (max(y_vals) - min(y_vals)) * 100
+
+                    resposta["roi"] = {
+                        "x": max(0, x_min - 5),
+                        "y": max(0, y_min - 5),
+                        "w": box_w + 10,
+                        "h": box_h + 10
+                    }
+
+                    pontos = []
+                    for lm in hand_landmarks.landmark:
+                        pontos.extend([lm.x, lm.y, lm.z])
+                    dados = np.array(pontos)
+
+                    if model_mlp:
+                        p = model_mlp.predict(dados.reshape(1, 63), verbose=0)
+                        resposta["mlp"] = {
+                            "letra": str(classes[np.argmax(p)]),
+                            "confianca": float(np.max(p)) * 100
+                        }
+
+                    if model_cnn:
+                        p = model_cnn.predict(dados.reshape(1, 21, 3), verbose=0)
+                        resposta["cnn"] = {
+                            "letra": str(classes[np.argmax(p)]),
+                            "confianca": float(np.max(p)) * 100
+                        }
+
+            await websocket.send_json(resposta)
 
     except Exception as e:
-        print(f"Conexão encerrada: {e}")
+        print("Desconectado", e)
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
